@@ -260,3 +260,27 @@ func BenchmarkMustResolve(b *testing.B) {
 		injector.MustResolve("database")
 	}
 }
+
+// -------------------------------------------------
+// Example structs used for testing purposes
+// -------------------------------------------------
+type Database struct {
+	Name string
+}
+
+func NewDB() *Database {
+	return &Database{
+		Name: "db",
+	}
+}
+
+// Example of another dependency
+type UserService struct {
+	DB *Database
+}
+
+func NewUserService(db *Database) *UserService {
+	return &UserService{
+		DB: db,
+	}
+}
