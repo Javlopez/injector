@@ -1,6 +1,7 @@
 package injector
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -29,55 +30,61 @@ func (suite *InjectorTestSuite) TestNewInjector() {
 	assert.Equal(suite.T(), 0, len(injector.factories))
 }
 
-// Test injecting an instance directly
+// Test injecting an instance directly by type
 func (suite *InjectorTestSuite) TestInjectInstance() {
 	db := &Database{Name: "test-db"}
 
-	suite.injector.Inject(db, "database")
+	suite.injector.Inject(db)
 
-	// Should be stored in dependencies, not factories
-	assert.Equal(suite.T(), 1, len(suite.injector.dependencies))
+	// Should be stored in typeRegistry, not dependencies or factories
+	assert.Equal(suite.T(), 1, len(suite.injector.typeRegistry))
+	assert.Equal(suite.T(), 0, len(suite.injector.dependencies))
 	assert.Equal(suite.T(), 0, len(suite.injector.factories))
 
-	// Verify the instance is stored correctly
-	storedDep, exists := suite.injector.dependencies["database"]
+	// Verify the instance is stored correctly by type
+	dbType := reflect.TypeOf(db)
+	storedDep, exists := suite.injector.typeRegistry[dbType]
 	assert.True(suite.T(), exists)
 	assert.Equal(suite.T(), db, storedDep)
 }
 
-// Test injecting a factory function
+// Test injecting a factory function by type
 func (suite *InjectorTestSuite) TestInjectFactory() {
-	suite.injector.Inject(NewDB, "database")
+	suite.injector.Inject(NewDB)
 
-	// Should be stored in factories, not dependencies
+	// Should be stored in typeRegistry, not factories or dependencies
+	assert.Equal(suite.T(), 1, len(suite.injector.typeRegistry))
 	assert.Equal(suite.T(), 0, len(suite.injector.dependencies))
-	assert.Equal(suite.T(), 1, len(suite.injector.factories))
+	assert.Equal(suite.T(), 0, len(suite.injector.factories))
 
-	// Verify the factory is stored
-	_, exists := suite.injector.factories["database"]
+	// Verify the factory is stored by its return type
+	factoryType := reflect.TypeOf(NewDB)
+	returnType := factoryType.Out(0) // *Database
+	storedDep, exists := suite.injector.typeRegistry[returnType]
 	assert.True(suite.T(), exists)
+	assert.NotNil(suite.T(), storedDep)
 }
 
-// Test resolving an existing instance
-func (suite *InjectorTestSuite) TestResolveInstance() {
+// Test injecting by name (new InjectByName method)
+func (suite *InjectorTestSuite) TestInjectByName() {
 	db := &Database{Name: "test-db"}
-	suite.injector.Inject(db, "database")
 
-	resolved, err := suite.injector.Resolve("database")
+	suite.injector.Inject(db)
 
-	assert.NoError(suite.T(), err)
-	assert.NotNil(suite.T(), resolved)
-	assert.Equal(suite.T(), db, resolved)
+	// Should be stored in dependencies, not typeRegistry or factories
+	assert.Equal(suite.T(), 1, len(suite.injector.typeRegistry))
+	assert.Equal(suite.T(), 0, len(suite.injector.dependencies))
+	assert.Equal(suite.T(), 0, len(suite.injector.factories))
 
-	// Should be able to cast to Database
-	resolvedDB, ok := resolved.(*Database)
-	assert.True(suite.T(), ok)
-	assert.Equal(suite.T(), "test-db", resolvedDB.Name)
+	// Verify the instance is stored correctly by name
+	storedDep, err := suite.injector.ResolveByTypeName("Database")
+	assert.Nil(suite.T(), err)
+	assert.Equal(suite.T(), db, storedDep)
 }
 
 // Test resolving from factory function
 func (suite *InjectorTestSuite) TestResolveFromFactory() {
-	suite.injector.Inject(NewDB, "database")
+	suite.injector.InjectByName(NewDB, "database")
 
 	resolved, err := suite.injector.Resolve("database")
 
@@ -98,7 +105,7 @@ func (suite *InjectorTestSuite) TestResolveFromFactory() {
 
 // Test singleton behavior - factory should only be called once
 func (suite *InjectorTestSuite) TestSingletonBehavior() {
-	suite.injector.Inject(NewDB, "database")
+	suite.injector.InjectByName(NewDB, "database")
 
 	// Resolve twice
 	resolved1, err1 := suite.injector.Resolve("database")
@@ -125,7 +132,7 @@ func (suite *InjectorTestSuite) TestResolveNonExistent() {
 // Test MustResolve with existing dependency
 func (suite *InjectorTestSuite) TestMustResolveSuccess() {
 	db := &Database{Name: "test-db"}
-	suite.injector.Inject(db, "database")
+	suite.injector.InjectByName(db, "database")
 
 	// Should not panic
 	resolved := suite.injector.MustResolve("database")
@@ -144,10 +151,10 @@ func (suite *InjectorTestSuite) TestMustResolvePanic() {
 // Test complex dependency injection scenario
 func (suite *InjectorTestSuite) TestComplexDependencyInjection() {
 	// Register database factory
-	suite.injector.Inject(NewDB, "database")
+	suite.injector.InjectByName(NewDB, "database")
 
 	// Register user service factory that depends on database
-	suite.injector.Inject(func() *UserService {
+	suite.injector.InjectByName(func() *UserService {
 		db := suite.injector.MustResolve("database").(*Database)
 		return NewUserService(db)
 	}, "userService")
@@ -170,11 +177,11 @@ func (suite *InjectorTestSuite) TestComplexDependencyInjection() {
 func (suite *InjectorTestSuite) TestOverrideDependency() {
 	// Register first dependency
 	db1 := &Database{Name: "db1"}
-	suite.injector.Inject(db1, "database")
+	suite.injector.InjectByName(db1, "database")
 
 	// Override with second dependency
 	db2 := &Database{Name: "db2"}
-	suite.injector.Inject(db2, "database")
+	suite.injector.InjectByName(db2, "database")
 
 	// Should resolve to the second dependency
 	resolved, err := suite.injector.Resolve("database")
@@ -190,9 +197,9 @@ func (suite *InjectorTestSuite) TestMultipleDependencies() {
 	db := &Database{Name: "test-db"}
 	userSvc := &UserService{DB: db}
 
-	suite.injector.Inject(db, "database")
-	suite.injector.Inject(userSvc, "userService")
-	suite.injector.Inject(NewDB, "dbFactory")
+	suite.injector.InjectByName(db, "database")
+	suite.injector.InjectByName(userSvc, "userService")
+	suite.injector.InjectByName(NewDB, "dbFactory")
 
 	assert.Equal(suite.T(), 2, len(suite.injector.dependencies))
 	assert.Equal(suite.T(), 1, len(suite.injector.factories))
@@ -223,37 +230,37 @@ func BenchmarkInjectInstance(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		injector.Inject(db, "database")
+		injector.InjectByName(db, "database")
 	}
 }
 
 func BenchmarkResolveInstance(b *testing.B) {
 	injector := NewInjector()
 	db := &Database{Name: "bench-db"}
-	injector.Inject(db, "database")
+	injector.InjectByName(db, "database")
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		injector.Resolve("database")
+		_, _ = injector.Resolve("database")
 	}
 }
 
 func BenchmarkResolveFromFactory(b *testing.B) {
 	injector := NewInjector()
-	injector.Inject(NewDB, "database")
+	injector.InjectByName(NewDB, "database")
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		// Clear dependencies to force factory call each time
 		delete(injector.dependencies, "database")
-		injector.Resolve("database")
+		_, _ = injector.Resolve("database")
 	}
 }
 
 func BenchmarkMustResolve(b *testing.B) {
 	injector := NewInjector()
 	db := &Database{Name: "bench-db"}
-	injector.Inject(db, "database")
+	injector.InjectByName(db, "database")
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
