@@ -1,5 +1,9 @@
 # Injector
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/Javlopez/injector.svg)](https://pkg.go.dev/github.com/Javlopez/injector)
+[![Go Report Card](https://goreportcard.com/badge/github.com/Javlopez/injector)](https://goreportcard.com/report/github.com/Javlopez/injector)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A simple, lightweight dependency injection container for Go.
 
 ## Highlights
