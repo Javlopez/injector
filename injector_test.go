@@ -427,3 +427,26 @@ func NewDB() *Database {
 		Name: "db",
 	}
 }
+
+// -------------------------------------------------
+// Example structs used for testing purposes
+// -------------------------------------------------
+type Database struct {
+	Name string
+}
+
+func NewDatabase() *Database {
+	return &Database{Name: "default-db"}
+}
+
+type UserRepository struct {
+	DB *Database
+}
+
+func NewUserRepository(db *Database) *UserRepository {
+	return &UserRepository{DB: db}
+}
+
+type UserService struct {
+	Repo *UserRepository
+}
