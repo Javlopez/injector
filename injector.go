@@ -34,6 +34,10 @@ type Injector struct {
 	// shutdownOrder records constructed Shutdowner instances in the order they
 	// were built, so Shutdown can close them in reverse.
 	shutdownOrder []Shutdowner
+	// strict, when set, records duplicate registrations so Validate/Build can
+	// report accidental double-wiring.
+	strict  bool
+	dupErrs []error
 }
 
 // NewInjector creates a new injector instance
@@ -46,11 +50,29 @@ func NewInjector() *Injector {
 	}
 }
 
+// Strict enables duplicate-registration detection: re-registering a type or
+// name that is already present is recorded and surfaced by Validate and Build,
+// catching accidental double-wiring. Returns the injector for chaining.
+func (i *Injector) Strict() *Injector {
+	i.mu.Lock()
+	i.strict = true
+	i.mu.Unlock()
+	return i
+}
+
 // InjectByName registers a dependency with a given name.
 // The dependency can be either an instance or a factory function.
 func (i *Injector) InjectByName(dependency interface{}, name string) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
+
+	if i.strict {
+		_, inDeps := i.dependencies[name]
+		_, inFactories := i.factories[name]
+		if inDeps || inFactories {
+			i.dupErrs = append(i.dupErrs, fmt.Errorf("injector: duplicate registration for name %q", name))
+		}
+	}
 
 	depType := reflect.TypeOf(dependency)
 
@@ -71,14 +93,24 @@ func (i *Injector) Inject(dependency interface{}) {
 
 	depType := reflect.TypeOf(dependency)
 
+	var key reflect.Type
 	if depType.Kind() == reflect.Func {
 		if depType.NumOut() > 0 {
-			returnType := depType.Out(0)
-			i.typeRegistry[returnType] = dependency
+			key = depType.Out(0)
 		}
 	} else {
-		i.typeRegistry[depType] = dependency
+		key = depType
 	}
+	if key == nil {
+		return // factory with no return value: nothing to register
+	}
+
+	if i.strict {
+		if _, exists := i.typeRegistry[key]; exists {
+			i.dupErrs = append(i.dupErrs, fmt.Errorf("injector: duplicate registration for %v", key))
+		}
+	}
+	i.typeRegistry[key] = dependency
 }
 
 // InjectIf registers the dependency only when cond is true. Sugar for the
@@ -306,9 +338,11 @@ func (i *Injector) resolveType(t reflect.Type, stack []reflect.Type) (interface{
 }
 
 // callFactory invokes a factory function, resolving each of its parameters from
-// the registry. It propagates a trailing error return and rejects variadic
-// factories, whose parameter list cannot be auto-wired unambiguously.
-func (i *Injector) callFactory(factory interface{}, out reflect.Type, stack []reflect.Type) (interface{}, error) {
+// the registry. It propagates a trailing error return, rejects variadic
+// factories, and recovers any panic from the constructor — annotating it with
+// the resolution path so a nil-deref deep in the graph yields a diagnosis
+// instead of a bare stack trace.
+func (i *Injector) callFactory(factory interface{}, out reflect.Type, stack []reflect.Type) (result interface{}, err error) {
 	fv := reflect.ValueOf(factory)
 	ft := fv.Type()
 
@@ -316,13 +350,27 @@ func (i *Injector) callFactory(factory interface{}, out reflect.Type, stack []re
 		return nil, fmt.Errorf("injector: cannot auto-wire variadic factory for %v", out)
 	}
 
+	defer func() {
+		if r := recover(); r != nil {
+			result = nil
+			err = fmt.Errorf("injector: panic constructing %v (%s): %v", out, chainString(stack), r)
+		}
+	}()
+
 	args := make([]reflect.Value, ft.NumIn())
 	for idx := 0; idx < ft.NumIn(); idx++ {
-		arg, err := i.resolveType(ft.In(idx), stack)
-		if err != nil {
-			return nil, err
+		p := ft.In(idx)
+		arg, aerr := i.resolveType(p, stack)
+		if aerr != nil {
+			return nil, aerr
 		}
-		args[idx] = reflect.ValueOf(arg)
+		if arg == nil {
+			// A provider returned a nil interface; pass a typed nil so the
+			// reflect call does not panic with "zero Value argument".
+			args[idx] = reflect.Zero(p)
+		} else {
+			args[idx] = reflect.ValueOf(arg)
+		}
 	}
 
 	results := fv.Call(args)
@@ -426,7 +474,8 @@ func (i *Injector) Validate() error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
-	var errs []error
+	// Duplicate registrations recorded under Strict mode surface here.
+	errs := append([]error(nil), i.dupErrs...)
 
 	const (
 		white = 0 // unvisited
@@ -502,6 +551,46 @@ func (i *Injector) Validate() error {
 	return errors.Join(errs...)
 }
 
+// Build validates the graph and then eagerly constructs every registered
+// provider (and every group member), so a constructor that only fails at
+// runtime — a panic, a failing Ping, a bad config — surfaces at startup instead
+// of on the first request. After Build returns nil, all singletons are
+// constructed and cached. It is the recommended composition-root entry point.
+func (i *Injector) Build() error {
+	if err := i.Validate(); err != nil {
+		return err
+	}
+
+	// Snapshot keys and groups under the lock; resolveType locks internally.
+	i.mu.Lock()
+	keys := make([]reflect.Type, 0, len(i.typeRegistry))
+	for k := range i.typeRegistry {
+		keys = append(keys, k)
+	}
+	groupNames := make([]string, 0, len(i.groups))
+	for g := range i.groups {
+		groupNames = append(groupNames, g)
+	}
+	i.mu.Unlock()
+
+	for _, k := range keys {
+		if _, err := i.resolveType(k, nil); err != nil {
+			return err
+		}
+	}
+	for _, g := range groupNames {
+		i.mu.Lock()
+		members := append([]interface{}(nil), i.groups[g]...)
+		i.mu.Unlock()
+		for idx, dep := range members {
+			if _, err := i.constructEntry(dep); err != nil {
+				return fmt.Errorf("injector: group %q member %d: %w", g, idx, err)
+			}
+		}
+	}
+	return nil
+}
+
 // ----------------------------------------------------------------------------
 // Lifecycle
 // ----------------------------------------------------------------------------
@@ -565,6 +654,10 @@ func (i *Injector) ResolveInto(target interface{}) error {
 		return err
 	}
 
+	if inst == nil {
+		v.Elem().Set(reflect.Zero(elemType))
+		return nil
+	}
 	rv := reflect.ValueOf(inst)
 	if !rv.Type().AssignableTo(elemType) {
 		return fmt.Errorf("injector: resolved type %v is not assignable to %v", rv.Type(), elemType)
@@ -587,11 +680,16 @@ func (i *Injector) Invoke(fn interface{}) error {
 
 	args := make([]reflect.Value, ft.NumIn())
 	for idx := 0; idx < ft.NumIn(); idx++ {
-		inst, err := i.resolveType(ft.In(idx), nil)
+		p := ft.In(idx)
+		inst, err := i.resolveType(p, nil)
 		if err != nil {
 			return err
 		}
-		args[idx] = reflect.ValueOf(inst)
+		if inst == nil {
+			args[idx] = reflect.Zero(p)
+		} else {
+			args[idx] = reflect.ValueOf(inst)
+		}
 	}
 
 	results := fv.Call(args)

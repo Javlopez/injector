@@ -17,6 +17,10 @@ in any order; the container wires the whole graph by type.
 - **Contextual errors** — a missing dependency names the chain that required it
 - **`Validate()`** — statically check the whole graph at startup *without
   constructing anything*, reporting every problem at once
+- **`Build()`** — eagerly construct everything so runtime constructor failures
+  (a panic, a failing `Ping`) surface at startup, not on the first request
+- **Panic recovery** — a constructor panic is recovered and annotated with the path
+- **Strict mode** — flag accidental duplicate registrations
 - **Lifecycle** — `Shutdown(ctx)` closes constructed `Shutdowner`s in reverse order
 - **Groups** — collect many providers of one interface as a slice (`[]http.Handler`)
 - **Thread-safe** registration and resolution
@@ -82,9 +86,10 @@ func BuildContainer(db *sql.DB) (*injector.Injector, error) {
     inj.Inject(NewUserService)
     inj.Inject(NewUserRepo)
 
-    // Fail fast: report every missing/ambiguous/cyclic dependency at startup,
-    // before a single constructor runs.
-    if err := inj.Validate(); err != nil {
+    // Fail fast at startup: Build validates the graph (every missing/ambiguous/
+    // cyclic dependency) AND eagerly constructs everything, so a constructor
+    // that only fails at runtime surfaces here instead of on the first request.
+    if err := inj.Build(); err != nil {
         return nil, err
     }
     return inj, nil
@@ -142,6 +147,31 @@ Sample output for a misconfigured graph:
 injector: no dependency found for type *app.Database (required by *app.Handler → *app.Service → *app.Repo → *app.Database)
 injector: cyclic dependency detected: *app.CycA → *app.CycB → *app.CycA
 injector: ambiguous dependency for app.Mailer: 2 candidates assignable (*app.ResendMailer, *app.OtherMailer)
+```
+
+## Build (eager construction) & Strict mode
+
+`Validate()` proves the graph is *resolvable* but constructs nothing. `Build()`
+goes further: it validates, then eagerly builds every provider, so a constructor
+that only fails at runtime is caught at startup.
+
+```go
+err := inj.Build()
+// injector: factory for *app.Database failed: connection refused
+```
+
+A recovered constructor panic is annotated with the resolution path:
+
+```
+injector: panic constructing *app.Repo (*app.Handler → *app.Service → *app.Repo): runtime error: nil pointer dereference
+```
+
+`Strict()` turns accidental double-wiring into a reported error:
+
+```go
+inj := injector.NewInjector().Strict()
+inj.Inject(NewDB)
+inj.Inject(NewDB) // Validate/Build now report: duplicate registration for *app.Database
 ```
 
 ## Lifecycle: Shutdown
@@ -221,12 +251,17 @@ as instance resolution.
 - [x] Circular dependency detection (with path)
 - [x] Contextual resolution errors
 - [x] Eager graph validation (`Validate`)
+- [x] Eager construction (`Build`) with panic recovery
+- [x] Strict mode (duplicate-registration detection)
 - [x] Thread-safety
 - [x] Lifecycle management (`Shutdown` hooks)
 - [x] Groups / multi-binding
 - [x] Type-safe generic resolution (Go 1.18+)
+- [ ] Struct-field parameters (fx.In-style) for large constructors
+- [ ] Named / qualified instances (two `*sql.DB`, primary/replica)
+- [ ] Provider modules / bundles
+- [ ] Ordered start hooks (`OnStart` with rollback)
 - [ ] Scopes (singleton / transient / scoped)
-- [ ] Configuration from files (JSON/YAML)
 
 ## FAQ
 
