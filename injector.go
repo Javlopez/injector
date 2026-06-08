@@ -446,9 +446,9 @@ func (e *ResolveError) Error() string {
 		return fmt.Sprintf("injector: cyclic dependency detected: %s", chainString(e.Chain))
 	case reasonAmbiguous:
 		return fmt.Sprintf("injector: ambiguous dependency for %v: %d candidates assignable (%s)%s",
-			e.Target, len(e.Candidates), typeList(e.Candidates), requiredBy(e.Chain, e.Target))
+			e.Target, len(e.Candidates), typeList(e.Candidates), requiredBy(e.Chain))
 	default:
-		return fmt.Sprintf("injector: no dependency found for type %v%s", e.Target, requiredBy(e.Chain, e.Target))
+		return fmt.Sprintf("injector: no dependency found for type %v%s", e.Target, requiredBy(e.Chain))
 	}
 }
 
@@ -472,9 +472,9 @@ func typeList(types []reflect.Type) string {
 
 // requiredBy appends a " (required by ...)" suffix when the failing type was
 // reached through one or more parent constructors.
-func requiredBy(chain []reflect.Type, target reflect.Type) string {
-	// The last element of chain is target itself; the parents are everything
-	// before it. Only render the suffix when there is at least one parent.
+func requiredBy(chain []reflect.Type) string {
+	// The last element of chain is the failing type itself; the parents are
+	// everything before it. Only render the suffix when there is a parent.
 	if len(chain) < 2 {
 		return ""
 	}

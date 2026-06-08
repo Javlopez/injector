@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # Go module dependencies.
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      # Group minor/patch bumps into one PR; majors get their own.
+      minor-patch:
+        update-types: ["minor", "patch"]
+
+  # GitHub Actions versions.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
