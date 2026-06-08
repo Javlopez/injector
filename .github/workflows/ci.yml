@@ -18,7 +18,7 @@ jobs:
       matrix:
         go: ["1.24", "1.25", "stable"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -46,7 +46,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Pin to the Go release golangci-lint is built against. Using `stable`
       # (now go1.26) makes golangci-lint v2.4.0 (built with go1.25) panic when
@@ -64,7 +64,7 @@ jobs:
   vuln:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Go
         uses: actions/setup-go@v5
