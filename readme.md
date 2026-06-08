@@ -21,8 +21,11 @@ in any order; the container wires the whole graph by type.
   (a panic, a failing `Ping`) surface at startup, not on the first request
 - **Panic recovery** — a constructor panic is recovered and annotated with the path
 - **Strict mode** — flag accidental duplicate registrations
-- **Lifecycle** — `Shutdown(ctx)` closes constructed `Shutdowner`s in reverse order
+- **Lifecycle** — `Start(ctx)` / `Shutdown(ctx)` via interfaces, with start rollback
+- **Modules** — a module is a plain `func(*Injector)`, composed with `Apply` (no DSL)
 - **Groups** — collect many providers of one interface as a slice (`[]http.Handler`)
+- **Struct parameters** — `In`-embedded structs for constructors with many deps
+- **Named instances** — several providers of one type (`primary`/`replica` DB)
 - **Thread-safe** registration and resolution
 - Type-safe generics: `For[T]`, `ResolveByType[T]`, `Get[T]`, `Must[T]`
 
@@ -130,6 +133,31 @@ explicitly with `Override` (see below).
 A factory may return `(T, error)`; a non-nil error aborts resolution and is
 wrapped (unwrappable with `errors.Is`).
 
+## Struct parameters (many dependencies)
+
+Constructors with a long positional parameter list become noisy and easy to
+misorder. Embed `In` in a struct and each exported field is resolved by type:
+
+```go
+type ServiceDeps struct {
+    injector.In
+    DB       *sql.DB
+    Logger   *slog.Logger
+    Users    UserRepo
+    Mailer   Mailer `optional:"true"` // left nil if not registered
+}
+
+func NewService(d ServiceDeps) *Service {
+    return &Service{db: d.DB, logger: d.Logger, users: d.Users, mailer: d.Mailer}
+}
+
+inj.Inject(NewService) // d.* fields are field-wired from the container
+```
+
+A field tagged `optional:"true"` resolves to its zero value when unregistered,
+instead of failing. `Validate` and `Build` expand the struct and check each
+field individually.
+
 ## Validate (eager graph check)
 
 `Validate()` walks every registered provider and group member **without calling
@@ -174,18 +202,41 @@ inj.Inject(NewDB)
 inj.Inject(NewDB) // Validate/Build now report: duplicate registration for *app.Database
 ```
 
-## Lifecycle: Shutdown
+## Modules
 
-Any constructed instance implementing `Shutdowner` is closed by `Shutdown`, in
-reverse construction order. Pre-registered instances are left to their owner.
+A module is just a `func(*Injector)` — no `Provide`/`Option` DSL. Split a large
+composition root into focused units and compose them with `Apply`:
 
 ```go
+func wireData(i *injector.Injector)    { i.Inject(NewDB); i.Inject(NewUserRepo) }
+func wireBilling(i *injector.Injector) { i.Inject(NewStripeClient); i.Inject(NewBillingService) }
+
+inj := injector.NewInjector().Apply(wireData, wireBilling, wireAuth)
+```
+
+## Lifecycle: Start & Shutdown
+
+Two symmetric interfaces, discovered automatically on constructed instances — a
+constructor implements them, it never depends on the container (unlike
+`fx.Lifecycle`):
+
+```go
+type Startable interface {
+    Start(ctx context.Context) error // run in construction order
+}
 type Shutdowner interface {
-    Shutdown(ctx context.Context) error
+    Shutdown(ctx context.Context) error // run in reverse construction order
 }
 
+if err := inj.Start(ctx); err != nil { // starts everything; rolls back on failure
+    log.Fatal(err)
+}
 defer inj.Shutdown(context.Background())
 ```
+
+`Start` runs every `Startable` in dependency order; if one fails it shuts down
+the already-started components (in reverse) before returning. Pre-registered
+instances are left to their owner.
 
 ## Groups
 
@@ -199,6 +250,28 @@ inj.InjectGroup("routes", NewOrdersRoute)
 
 routes, err := injector.ResolveGroup[http.Handler](inj, "routes")
 ```
+
+## Named instances
+
+Register several providers of the same type under a qualifier, then resolve by
+name — or pull them into an `In`-struct with a `name:"..."` tag:
+
+```go
+inj.InjectQualified("primary", NewPrimaryDB) // func() *sql.DB
+inj.InjectQualified("replica", NewReplicaDB) // func() *sql.DB
+
+primary, _ := injector.GetNamed[*sql.DB](inj, "primary")
+
+type RepoDeps struct {
+    injector.In
+    Writer *sql.DB `name:"primary"`
+    Reader *sql.DB `name:"replica"`
+}
+func NewRepo(d RepoDeps) *Repo { ... }
+```
+
+Qualified factory parameters are auto-wired, results are cached (singleton per
+name), and `Validate`/`Build` cover them like any other provider.
 
 ## Conditional registration & Override
 
@@ -257,20 +330,20 @@ as instance resolution.
 - [x] Lifecycle management (`Shutdown` hooks)
 - [x] Groups / multi-binding
 - [x] Type-safe generic resolution (Go 1.18+)
-- [ ] Struct-field parameters (fx.In-style) for large constructors
-- [ ] Named / qualified instances (two `*sql.DB`, primary/replica)
-- [ ] Provider modules / bundles
-- [ ] Ordered start hooks (`OnStart` with rollback)
+- [x] Struct-field parameters (`In`) for large constructors
+- [x] Named / qualified instances (two `*sql.DB`, primary/replica)
+- [x] Provider modules (`func(*Injector)` + `Apply`)
+- [x] Ordered start hooks (`Start` with rollback)
+- [x] Exactly-once construction (per-key `sync.Once`)
 - [ ] Scopes (singleton / transient / scoped)
 
 ## FAQ
 
 **Q: Is this thread-safe?**
-A: Yes. Registration and resolution are guarded by a mutex; the factory call
-itself runs without the lock so re-entrant factories don't deadlock. The suite
-passes under `go test -race`. Concurrent first-resolution of the same type may
-construct twice and keep one winner, so factories should be idempotent — in the
-normal "build at startup" flow this never happens.
+A: Yes. Each provider is memoized behind a per-key `sync.Once`, so a factory
+runs **exactly once** even under concurrent first-resolution — every caller
+observes the same instance. The factory itself runs without the global lock held,
+so re-entrant factories don't deadlock. The suite passes under `go test -race`.
 
 **Q: How is registration order handled?**
 A: It is irrelevant. Parameters are resolved recursively from the registry when

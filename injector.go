@@ -28,12 +28,23 @@ type Injector struct {
 	dependencies map[string]interface{}
 	factories    map[string]reflect.Value
 	typeRegistry map[reflect.Type]interface{}
+	// cells memoizes constructed singletons keyed by reflect.Type (unqualified)
+	// or qualKey (qualified). Each cell's sync.Once guarantees a provider runs
+	// exactly once even under concurrent first-resolution — no double-checked
+	// locking, no double construction.
+	cells map[any]*cell
+	// qualified holds providers keyed by (type, name) so several providers of
+	// one type can coexist (e.g. a "primary" and "replica" *sql.DB).
+	qualified map[qualKey]interface{}
 	// groups holds named collections of providers resolved together as a slice
 	// (e.g. all HTTP handlers). Members are NOT deduplicated by type.
 	groups map[string][]interface{}
 	// shutdownOrder records constructed Shutdowner instances in the order they
 	// were built, so Shutdown can close them in reverse.
 	shutdownOrder []Shutdowner
+	// startOrder records constructed Startable instances in construction order,
+	// so Start can run them in dependency order.
+	startOrder []Startable
 	// strict, when set, records duplicate registrations so Validate/Build can
 	// report accidental double-wiring.
 	strict  bool
@@ -46,7 +57,60 @@ func NewInjector() *Injector {
 		dependencies: make(map[string]interface{}),
 		factories:    make(map[string]reflect.Value),
 		typeRegistry: make(map[reflect.Type]interface{}),
+		cells:        make(map[any]*cell),
+		qualified:    make(map[qualKey]interface{}),
 		groups:       make(map[string][]interface{}),
+	}
+}
+
+// qualKey identifies a qualified registration by its type and qualifier name.
+type qualKey struct {
+	t    reflect.Type
+	name string
+}
+
+// cell memoizes a single constructed singleton. The sync.Once makes the factory
+// run exactly once; concurrent callers block until it is built and observe the
+// same value (or the same construction error).
+type cell struct {
+	once sync.Once
+	val  interface{}
+	err  error
+}
+
+// buildOnce constructs (or returns the memoized result of) the provider for a
+// cache key. keyType is the registered type used for the resolution stack and
+// error messages. A constructed Shutdowner is tracked for Shutdown.
+func (i *Injector) buildOnce(cacheKey any, dep interface{}, keyType reflect.Type, stack []reflect.Type) (interface{}, error) {
+	i.mu.Lock()
+	c := i.cells[cacheKey]
+	if c == nil {
+		c = &cell{}
+		i.cells[cacheKey] = c
+	}
+	i.mu.Unlock()
+
+	c.once.Do(func() {
+		// The factory runs WITHOUT the lock held (it resolves dependencies
+		// re-entrantly); the cell's Once serializes construction per key.
+		c.val, c.err = i.callFactory(dep, keyType, append(stack, keyType))
+		if c.err == nil {
+			i.trackLifecycle(c.val)
+		}
+	})
+	return c.val, c.err
+}
+
+// trackLifecycle records a constructed instance for Start/Shutdown if it
+// implements the corresponding interface.
+func (i *Injector) trackLifecycle(val interface{}) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if s, ok := val.(Shutdowner); ok {
+		i.shutdownOrder = append(i.shutdownOrder, s)
+	}
+	if s, ok := val.(Startable); ok {
+		i.startOrder = append(i.startOrder, s)
 	}
 }
 
@@ -57,6 +121,21 @@ func (i *Injector) Strict() *Injector {
 	i.mu.Lock()
 	i.strict = true
 	i.mu.Unlock()
+	return i
+}
+
+// Module is a registrar function that wires a related set of providers into an
+// injector. A module is just a function — there is no Option/Provide DSL — so a
+// large composition root splits into focused units (wireBilling, wireAuth, …)
+// with no new types to learn.
+type Module = func(*Injector)
+
+// Apply runs each module against the injector, in order, and returns it for
+// chaining: injector.NewInjector().Apply(wireDB, wireAuth, wireBilling).
+func (i *Injector) Apply(modules ...Module) *Injector {
+	for _, m := range modules {
+		m(i)
+	}
 	return i
 }
 
@@ -141,7 +220,7 @@ func (i *Injector) InjectOr(cond bool, primary, fallback interface{}) {
 // on. Primarily for tests: build the real graph, then swap one collaborator for
 // a mock.
 func Override[T any](i *Injector, value T) {
-	t := reflect.TypeOf((*T)(nil)).Elem()
+	t := reflect.TypeFor[T]()
 	i.mu.Lock()
 	i.typeRegistry[t] = value
 	i.mu.Unlock()
@@ -179,11 +258,139 @@ func ResolveGroup[T any](i *Injector, group string) ([]T, error) {
 		typed, ok := inst.(T)
 		if !ok {
 			return nil, fmt.Errorf("injector: group %q member %d: cannot cast %T to %s",
-				group, idx, inst, reflect.TypeOf((*T)(nil)).Elem())
+				group, idx, inst, reflect.TypeFor[T]())
 		}
 		out = append(out, typed)
 	}
 	return out, nil
+}
+
+// ----------------------------------------------------------------------------
+// Qualified (named) registrations
+// ----------------------------------------------------------------------------
+
+// InjectQualified registers a dependency under a (type, name) qualifier, so
+// several providers of the same type can coexist (e.g. a "primary" and a
+// "replica" *sql.DB, or two implementations of one interface). Resolve with
+// GetNamed / MustNamed, or with a `name:"..."` tag on an In-struct field.
+// Factory parameters are auto-wired like any other provider.
+func (i *Injector) InjectQualified(name string, dependency interface{}) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	depType := reflect.TypeOf(dependency)
+	var key reflect.Type
+	if depType.Kind() == reflect.Func {
+		if depType.NumOut() > 0 {
+			key = depType.Out(0)
+		}
+	} else {
+		key = depType
+	}
+	if key == nil {
+		return
+	}
+
+	qk := qualKey{key, name}
+	if i.strict {
+		if _, exists := i.qualified[qk]; exists {
+			i.dupErrs = append(i.dupErrs, fmt.Errorf("injector: duplicate registration for %v name %q", key, name))
+		}
+	}
+	i.qualified[qk] = dependency
+}
+
+// lookupQualified finds a qualified entry by (type, name): exact match, then by
+// clean type name, then by assignability among entries with the same name.
+// Multiple assignable matches under one name are reported as ambiguous. Caller
+// must hold the lock.
+func (i *Injector) lookupQualified(t reflect.Type, name string) (interface{}, qualKey, bool, error) {
+	if d, ok := i.qualified[qualKey{t, name}]; ok {
+		return d, qualKey{t, name}, true, nil
+	}
+
+	tn := i.getTypeName(t)
+	var (
+		mDep  interface{}
+		mKey  qualKey
+		mKeys []qualKey
+	)
+	for qk, d := range i.qualified {
+		if qk.name != name {
+			continue
+		}
+		if i.getTypeName(qk.t) == tn || qk.t.AssignableTo(t) {
+			mDep, mKey = d, qk
+			mKeys = append(mKeys, qk)
+		}
+	}
+	switch len(mKeys) {
+	case 0:
+		return nil, qualKey{}, false, nil
+	case 1:
+		return mDep, mKey, true, nil
+	default:
+		cands := make([]reflect.Type, len(mKeys))
+		for idx, k := range mKeys {
+			cands[idx] = k.t
+		}
+		return nil, qualKey{}, false, &errAmbiguous{candidates: cands}
+	}
+}
+
+// resolveQualified resolves a (type, name) dependency, auto-wiring and caching
+// factory results like resolveType does for unqualified providers.
+func (i *Injector) resolveQualified(t reflect.Type, name string, stack []reflect.Type) (interface{}, error) {
+	i.mu.Lock()
+	dep, qk, ok, lerr := i.lookupQualified(t, name)
+	i.mu.Unlock()
+
+	if lerr != nil {
+		return nil, &ResolveError{Target: t, Chain: append(stack, t), Reason: reasonAmbiguous, Candidates: ambiguousCandidates(lerr)}
+	}
+	if !ok {
+		suffix := ""
+		if len(stack) > 0 {
+			suffix = fmt.Sprintf(" (required by %s)", chainString(append(stack, t)))
+		}
+		return nil, fmt.Errorf("injector: no dependency found for type %v name %q%s", t, name, suffix)
+	}
+
+	if reflect.TypeOf(dep).Kind() != reflect.Func {
+		return dep, nil
+	}
+
+	for _, s := range stack {
+		if s == qk.t {
+			return nil, &ResolveError{Target: qk.t, Chain: append(stack, qk.t), Reason: reasonCycle}
+		}
+	}
+
+	return i.buildOnce(qk, dep, qk.t, stack)
+}
+
+// GetNamed resolves a qualified dependency by type and name.
+func GetNamed[T any](i *Injector, name string) (T, error) {
+	var zero T
+	t := reflect.TypeFor[T]()
+	inst, err := i.resolveQualified(t, name, nil)
+	if err != nil {
+		return zero, err
+	}
+	res, ok := inst.(T)
+	if !ok {
+		return zero, fmt.Errorf("injector: type mismatch: cannot cast %T to %s", inst, t)
+	}
+	return res, nil
+}
+
+// MustNamed is like GetNamed but panics on error.
+func MustNamed[T any](i *Injector, name string) T {
+	v, err := GetNamed[T](i, name)
+	if err != nil {
+		panic(err)
+	}
+	return v
 }
 
 // constructEntry builds a single dependency (instance or factory) WITHOUT
@@ -203,11 +410,7 @@ func (i *Injector) constructEntry(dep interface{}) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	if s, ok := inst.(Shutdowner); ok {
-		i.mu.Lock()
-		i.shutdownOrder = append(i.shutdownOrder, s)
-		i.mu.Unlock()
-	}
+	i.trackLifecycle(inst)
 	return inst, nil
 }
 
@@ -299,49 +502,93 @@ func (i *Injector) resolveType(t reflect.Type, stack []reflect.Type) (interface{
 		return nil, &ResolveError{Target: t, Chain: append(stack, t), Reason: reasonNotFound}
 	}
 
-	// A cached instance (anything that is not a factory func) resolves directly.
+	// A pre-registered instance (anything that is not a factory func) resolves
+	// directly.
 	if reflect.TypeOf(dep).Kind() != reflect.Func {
 		return dep, nil
 	}
 
-	// dep is a factory keyed by `key`. Detect a cycle before descending.
+	// dep is a factory keyed by `key`. Detect a cycle BEFORE the once-cell: a
+	// re-entrant same-key resolution is the cycle, and entering the Once again
+	// on the same goroutine would otherwise deadlock.
 	for _, s := range stack {
 		if s == key {
 			return nil, &ResolveError{Target: key, Chain: append(stack, key), Reason: reasonCycle}
 		}
 	}
 
-	// The factory is called WITHOUT the lock held: a factory closure may resolve
-	// other dependencies re-entrantly, and a non-reentrant mutex would deadlock.
-	inst, ferr := i.callFactory(dep, key, append(stack, key))
-	if ferr != nil {
-		return nil, ferr
-	}
+	return i.buildOnce(key, dep, key, stack)
+}
 
-	// Cache the constructed instance under its registered key (singleton).
-	// Double-check: a concurrent goroutine may have cached the same key while we
-	// were constructing — if so, discard ours and return the winner so callers
-	// still observe a single shared instance.
-	i.mu.Lock()
-	if cached, exists := i.typeRegistry[key]; exists {
-		if reflect.TypeOf(cached).Kind() != reflect.Func {
-			i.mu.Unlock()
-			return cached, nil
+// In is an embeddable marker. A constructor parameter whose struct embeds In
+// has each of its exported fields resolved individually from the container,
+// instead of the struct being treated as a single dependency. This keeps
+// constructors with many dependencies readable:
+//
+//	type Deps struct {
+//	    injector.In
+//	    DB     *sql.DB
+//	    Logger *slog.Logger
+//	    Repo   UserRepo `optional:"true"`
+//	}
+//	func NewService(d Deps) *Service { ... }
+//
+// A field tagged `optional:"true"` is left as its zero value when unresolvable.
+type In struct{}
+
+var inType = reflect.TypeOf(In{})
+
+// isInParam reports whether t is a struct that embeds In.
+func isInParam(t reflect.Type) bool {
+	if t.Kind() != reflect.Struct {
+		return false
+	}
+	for f := 0; f < t.NumField(); f++ {
+		sf := t.Field(f)
+		if sf.Anonymous && sf.Type == inType {
+			return true
 		}
 	}
-	i.typeRegistry[key] = inst
-	if s, isShutdowner := inst.(Shutdowner); isShutdowner {
-		i.shutdownOrder = append(i.shutdownOrder, s)
+	return false
+}
+
+// buildIn constructs an In-struct by resolving each exported field from the
+// container. Fields tagged `optional:"true"` are left zero when unresolvable.
+func (i *Injector) buildIn(t reflect.Type, stack []reflect.Type) (reflect.Value, error) {
+	out := reflect.New(t).Elem()
+	for f := 0; f < t.NumField(); f++ {
+		sf := t.Field(f)
+		if (sf.Anonymous && sf.Type == inType) || sf.PkgPath != "" {
+			continue // the In marker, or an unexported field
+		}
+
+		var (
+			inst interface{}
+			err  error
+		)
+		if name := sf.Tag.Get("name"); name != "" {
+			inst, err = i.resolveQualified(sf.Type, name, stack)
+		} else {
+			inst, err = i.resolveType(sf.Type, stack)
+		}
+		if err != nil {
+			if sf.Tag.Get("optional") == "true" {
+				continue
+			}
+			return reflect.Value{}, err
+		}
+		if inst != nil {
+			out.Field(f).Set(reflect.ValueOf(inst))
+		}
 	}
-	i.mu.Unlock()
-	return inst, nil
+	return out, nil
 }
 
 // callFactory invokes a factory function, resolving each of its parameters from
-// the registry. It propagates a trailing error return, rejects variadic
-// factories, and recovers any panic from the constructor — annotating it with
-// the resolution path so a nil-deref deep in the graph yields a diagnosis
-// instead of a bare stack trace.
+// the registry. A parameter that embeds In is expanded into its fields. It
+// propagates a trailing error return, rejects variadic factories, and recovers
+// any panic from the constructor — annotating it with the resolution path so a
+// nil-deref deep in the graph yields a diagnosis instead of a bare stack trace.
 func (i *Injector) callFactory(factory interface{}, out reflect.Type, stack []reflect.Type) (result interface{}, err error) {
 	fv := reflect.ValueOf(factory)
 	ft := fv.Type()
@@ -360,6 +607,14 @@ func (i *Injector) callFactory(factory interface{}, out reflect.Type, stack []re
 	args := make([]reflect.Value, ft.NumIn())
 	for idx := 0; idx < ft.NumIn(); idx++ {
 		p := ft.In(idx)
+		if isInParam(p) {
+			v, ierr := i.buildIn(p, stack)
+			if ierr != nil {
+				return nil, ierr
+			}
+			args[idx] = v
+			continue
+		}
 		arg, aerr := i.resolveType(p, stack)
 		if aerr != nil {
 			return nil, aerr
@@ -484,33 +739,69 @@ func (i *Injector) Validate() error {
 	)
 	color := make(map[reflect.Type]int)
 
-	var visit func(key reflect.Type, dep interface{}, path []reflect.Type)
+	var (
+		visit       func(key reflect.Type, dep interface{}, path []reflect.Type)
+		check       func(p reflect.Type, optional bool, path []reflect.Type)
+		checkParams func(ft reflect.Type, path []reflect.Type, label string)
+	)
+
+	// check validates a single dependency type against the registry and descends
+	// into its provider for cycle detection.
+	check = func(p reflect.Type, optional bool, path []reflect.Type) {
+		depP, keyP, ok, lerr := i.lookup(p)
+		chain := append(append([]reflect.Type{}, path...), p)
+		switch {
+		case lerr != nil:
+			errs = append(errs, &ResolveError{Target: p, Chain: chain, Reason: reasonAmbiguous, Candidates: ambiguousCandidates(lerr)})
+		case !ok:
+			if !optional {
+				errs = append(errs, &ResolveError{Target: p, Chain: chain, Reason: reasonNotFound})
+			}
+		case color[keyP] == gray:
+			errs = append(errs, &ResolveError{Target: keyP, Chain: append(append([]reflect.Type{}, path...), keyP), Reason: reasonCycle})
+		case color[keyP] == white:
+			visit(keyP, depP, path)
+		}
+	}
+
+	// checkParams checks every parameter of a factory, expanding In-structs into
+	// their exported fields (honoring `optional:"true"`).
+	checkParams = func(ft reflect.Type, path []reflect.Type, label string) {
+		if ft.IsVariadic() {
+			errs = append(errs, fmt.Errorf("injector: %svariadic factory cannot be auto-wired", label))
+			return
+		}
+		for idx := 0; idx < ft.NumIn(); idx++ {
+			p := ft.In(idx)
+			if isInParam(p) {
+				for f := 0; f < p.NumField(); f++ {
+					sf := p.Field(f)
+					if (sf.Anonymous && sf.Type == inType) || sf.PkgPath != "" {
+						continue
+					}
+					optional := sf.Tag.Get("optional") == "true"
+					if name := sf.Tag.Get("name"); name != "" {
+						if _, _, ok, lerr := i.lookupQualified(sf.Type, name); lerr != nil {
+							errs = append(errs, &ResolveError{Target: sf.Type, Chain: []reflect.Type{sf.Type}, Reason: reasonAmbiguous, Candidates: ambiguousCandidates(lerr)})
+						} else if !ok && !optional {
+							errs = append(errs, fmt.Errorf("injector: no dependency found for type %v name %q", sf.Type, name))
+						}
+						continue
+					}
+					check(sf.Type, optional, path)
+				}
+				continue
+			}
+			check(p, false, path)
+		}
+	}
+
 	visit = func(key reflect.Type, dep interface{}, path []reflect.Type) {
 		color[key] = gray
 		path = append(path, key)
-
-		if reflect.TypeOf(dep).Kind() == reflect.Func {
-			ft := reflect.TypeOf(dep)
-			if ft.IsVariadic() {
-				errs = append(errs, fmt.Errorf("injector: cannot auto-wire variadic factory for %v", key))
-			} else {
-				for idx := 0; idx < ft.NumIn(); idx++ {
-					p := ft.In(idx)
-					depP, keyP, ok, lerr := i.lookup(p)
-					switch {
-					case lerr != nil:
-						errs = append(errs, &ResolveError{Target: p, Chain: append(append([]reflect.Type{}, path...), p), Reason: reasonAmbiguous, Candidates: ambiguousCandidates(lerr)})
-					case !ok:
-						errs = append(errs, &ResolveError{Target: p, Chain: append(append([]reflect.Type{}, path...), p), Reason: reasonNotFound})
-					case color[keyP] == gray:
-						errs = append(errs, &ResolveError{Target: keyP, Chain: append(append([]reflect.Type{}, path...), keyP), Reason: reasonCycle})
-					case color[keyP] == white:
-						visit(keyP, depP, path)
-					}
-				}
-			}
+		if ft := reflect.TypeOf(dep); ft.Kind() == reflect.Func {
+			checkParams(ft, path, fmt.Sprintf("factory for %v: ", key))
 		}
-
 		color[key] = black
 	}
 
@@ -521,30 +812,20 @@ func (i *Injector) Validate() error {
 	}
 
 	// Group members are not keyed by type (they may share a return type), so
-	// validate each member's parameters directly and descend into the type
-	// graph for cycle/missing checks.
+	// validate each member's parameters directly.
 	for group, members := range i.groups {
 		for idx, dep := range members {
-			ft := reflect.TypeOf(dep)
-			if ft.Kind() != reflect.Func {
-				continue
+			if ft := reflect.TypeOf(dep); ft.Kind() == reflect.Func {
+				checkParams(ft, nil, fmt.Sprintf("group %q member %d: ", group, idx))
 			}
-			if ft.IsVariadic() {
-				errs = append(errs, fmt.Errorf("injector: group %q member %d: variadic factory cannot be auto-wired", group, idx))
-				continue
-			}
-			for k := 0; k < ft.NumIn(); k++ {
-				p := ft.In(k)
-				depP, keyP, ok, lerr := i.lookup(p)
-				switch {
-				case lerr != nil:
-					errs = append(errs, &ResolveError{Target: p, Chain: []reflect.Type{p}, Reason: reasonAmbiguous, Candidates: ambiguousCandidates(lerr)})
-				case !ok:
-					errs = append(errs, &ResolveError{Target: p, Chain: []reflect.Type{p}, Reason: reasonNotFound})
-				case color[keyP] == white:
-					visit(keyP, depP, nil)
-				}
-			}
+		}
+	}
+
+	// Qualified factories: validate their parameters (unqualified, resolved from
+	// the type registry).
+	for qk, dep := range i.qualified {
+		if ft := reflect.TypeOf(dep); ft.Kind() == reflect.Func {
+			checkParams(ft, nil, fmt.Sprintf("qualified %v name %q: ", qk.t, qk.name))
 		}
 	}
 
@@ -567,6 +848,10 @@ func (i *Injector) Build() error {
 	for k := range i.typeRegistry {
 		keys = append(keys, k)
 	}
+	qkeys := make([]qualKey, 0, len(i.qualified))
+	for qk := range i.qualified {
+		qkeys = append(qkeys, qk)
+	}
 	groupNames := make([]string, 0, len(i.groups))
 	for g := range i.groups {
 		groupNames = append(groupNames, g)
@@ -575,6 +860,11 @@ func (i *Injector) Build() error {
 
 	for _, k := range keys {
 		if _, err := i.resolveType(k, nil); err != nil {
+			return err
+		}
+	}
+	for _, qk := range qkeys {
+		if _, err := i.resolveQualified(qk.t, qk.name, nil); err != nil {
 			return err
 		}
 	}
@@ -594,6 +884,38 @@ func (i *Injector) Build() error {
 // ----------------------------------------------------------------------------
 // Lifecycle
 // ----------------------------------------------------------------------------
+
+// Startable is implemented by dependencies that need an explicit start step
+// (open a pool, launch a background loop, run migrations). Unlike fx.Lifecycle,
+// a constructor never depends on the container: it just implements this
+// interface, and the container discovers it.
+type Startable interface {
+	Start(ctx context.Context) error
+}
+
+// Start runs every constructed Startable in construction order (dependencies
+// before dependents). If one fails, it rolls back by shutting down the
+// already-started instances that are Shutdowners, in reverse, then returns the
+// error. Call it after Build, before serving traffic.
+func (i *Injector) Start(ctx context.Context) error {
+	i.mu.Lock()
+	order := append([]Startable(nil), i.startOrder...)
+	i.mu.Unlock()
+
+	started := make([]Startable, 0, len(order))
+	for _, s := range order {
+		if err := s.Start(ctx); err != nil {
+			for j := len(started) - 1; j >= 0; j-- {
+				if sd, ok := started[j].(Shutdowner); ok {
+					_ = sd.Shutdown(ctx)
+				}
+			}
+			return fmt.Errorf("injector: start failed: %w", err)
+		}
+		started = append(started, s)
+	}
+	return nil
+}
 
 // Shutdown closes every constructed Shutdowner in reverse construction order,
 // joining any errors. It is idempotent: the tracked set is cleared, so a second
@@ -681,6 +1003,14 @@ func (i *Injector) Invoke(fn interface{}) error {
 	args := make([]reflect.Value, ft.NumIn())
 	for idx := 0; idx < ft.NumIn(); idx++ {
 		p := ft.In(idx)
+		if isInParam(p) {
+			v, err := i.buildIn(p, nil)
+			if err != nil {
+				return err
+			}
+			args[idx] = v
+			continue
+		}
 		inst, err := i.resolveType(p, nil)
 		if err != nil {
 			return err
@@ -760,7 +1090,7 @@ func For[T any](i *Injector) *TypeResolver[T] {
 // Resolve resolves a dependency by its type with error handling.
 func (tr *TypeResolver[T]) Resolve() (T, error) {
 	var zero T
-	targetType := reflect.TypeOf((*T)(nil)).Elem()
+	targetType := reflect.TypeFor[T]()
 
 	inst, err := tr.injector.resolveType(targetType, nil)
 	if err != nil {
