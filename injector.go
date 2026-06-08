@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -879,6 +881,144 @@ func (i *Injector) Build() error {
 		}
 	}
 	return nil
+}
+
+// ----------------------------------------------------------------------------
+// Introspection
+// ----------------------------------------------------------------------------
+
+// Graph yields each registered (unqualified) provider type together with the
+// types it depends on (In-struct parameters are expanded into their fields). It
+// is a range-over-func iterator, so it composes with the iter package:
+//
+//	for t, deps := range inj.Graph() { ... }
+func (i *Injector) Graph() iter.Seq2[reflect.Type, []reflect.Type] {
+	return func(yield func(reflect.Type, []reflect.Type) bool) {
+		type pair struct {
+			t    reflect.Type
+			deps []reflect.Type
+		}
+		i.mu.Lock()
+		pairs := make([]pair, 0, len(i.typeRegistry))
+		for t, dep := range i.typeRegistry {
+			pairs = append(pairs, pair{t, dependencyTypes(dep)})
+		}
+		i.mu.Unlock()
+
+		// Yield outside the lock so loop bodies may call back into the injector.
+		for _, p := range pairs {
+			if !yield(p.t, p.deps) {
+				return
+			}
+		}
+	}
+}
+
+// dependencyTypes returns the dependency types a provider declares: factory
+// parameter types, with In-struct parameters expanded into their exported
+// fields. Instances declare none.
+func dependencyTypes(dep interface{}) []reflect.Type {
+	ft := reflect.TypeOf(dep)
+	if ft.Kind() != reflect.Func {
+		return nil
+	}
+	var deps []reflect.Type
+	for idx := 0; idx < ft.NumIn(); idx++ {
+		p := ft.In(idx)
+		if isInParam(p) {
+			for f := 0; f < p.NumField(); f++ {
+				sf := p.Field(f)
+				if (sf.Anonymous && sf.Type == inType) || sf.PkgPath != "" {
+					continue
+				}
+				deps = append(deps, sf.Type)
+			}
+			continue
+		}
+		deps = append(deps, p)
+	}
+	return deps
+}
+
+// Describe returns a human-readable, deterministic summary of the graph:
+// providers and their dependencies, named instances, and groups. Handy for
+// eyeballing a large composition root.
+func (i *Injector) Describe() string {
+	type entry struct {
+		name string
+		deps []string
+	}
+
+	i.mu.Lock()
+	providers := make([]entry, 0, len(i.typeRegistry))
+	for t, dep := range i.typeRegistry {
+		deps := dependencyTypes(dep)
+		ds := make([]string, len(deps))
+		for k, d := range deps {
+			ds[k] = d.String()
+		}
+		sort.Strings(ds)
+		providers = append(providers, entry{t.String(), ds})
+	}
+	named := make([]string, 0, len(i.qualified))
+	for qk := range i.qualified {
+		named = append(named, fmt.Sprintf("%s (name %q)", qk.t.String(), qk.name))
+	}
+	groups := make([]string, 0, len(i.groups))
+	for g, members := range i.groups {
+		groups = append(groups, fmt.Sprintf("%s (%d members)", g, len(members)))
+	}
+	i.mu.Unlock()
+
+	sort.Slice(providers, func(a, b int) bool { return providers[a].name < providers[b].name })
+	sort.Strings(named)
+	sort.Strings(groups)
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "injector: %d providers", len(providers))
+	if len(named) > 0 {
+		fmt.Fprintf(&b, ", %d named", len(named))
+	}
+	if len(groups) > 0 {
+		fmt.Fprintf(&b, ", %d groups", len(groups))
+	}
+	b.WriteString("\n")
+	for _, p := range providers {
+		if len(p.deps) == 0 {
+			fmt.Fprintf(&b, "  %s\n", p.name)
+		} else {
+			fmt.Fprintf(&b, "  %s ← %s\n", p.name, strings.Join(p.deps, ", "))
+		}
+	}
+	for _, n := range named {
+		fmt.Fprintf(&b, "  [named] %s\n", n)
+	}
+	for _, g := range groups {
+		fmt.Fprintf(&b, "  [group] %s\n", g)
+	}
+	return b.String()
+}
+
+// DOT renders the dependency graph in Graphviz DOT format (paste into any
+// Graphviz tool to visualize). Edges are sorted for stable output.
+func (i *Injector) DOT() string {
+	var edges []string
+	for t, deps := range i.Graph() {
+		for _, d := range deps {
+			edges = append(edges, fmt.Sprintf("  %q -> %q;", t.String(), d.String()))
+		}
+	}
+	sort.Strings(edges)
+
+	var b strings.Builder
+	b.WriteString("digraph injector {\n")
+	b.WriteString("  rankdir=LR;\n")
+	for _, e := range edges {
+		b.WriteString(e)
+		b.WriteString("\n")
+	}
+	b.WriteString("}\n")
+	return b.String()
 }
 
 // ----------------------------------------------------------------------------

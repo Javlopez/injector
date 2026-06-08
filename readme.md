@@ -26,6 +26,7 @@ in any order; the container wires the whole graph by type.
 - **Groups** — collect many providers of one interface as a slice (`[]http.Handler`)
 - **Struct parameters** — `In`-embedded structs for constructors with many deps
 - **Named instances** — several providers of one type (`primary`/`replica` DB)
+- **Introspection** — `Graph()` iterator, `Describe()` text dump, `DOT()` for Graphviz
 - **Thread-safe** registration and resolution
 - Type-safe generics: `For[T]`, `ResolveByType[T]`, `Get[T]`, `Must[T]`
 
@@ -202,6 +203,29 @@ inj.Inject(NewDB)
 inj.Inject(NewDB) // Validate/Build now report: duplicate registration for *app.Database
 ```
 
+## Introspection
+
+See exactly what the container will wire — useful for a large composition root:
+
+```go
+fmt.Println(inj.Describe())
+// injector: 5 providers, 1 named, 1 groups
+//   *app.Repo ← *app.Database
+//   *app.Service ← *app.Repo, app.Mailer
+//   ...
+
+os.WriteFile("graph.dot", []byte(inj.DOT()), 0o644) // visualize with Graphviz
+```
+
+`Graph()` is a range-over-func iterator over `(provider, dependencies)`, so you
+can build your own analysis:
+
+```go
+for t, deps := range inj.Graph() {
+    fmt.Printf("%v needs %v\n", t, deps)
+}
+```
+
 ## Modules
 
 A module is just a `func(*Injector)` — no `Provide`/`Option` DSL. Split a large
@@ -335,6 +359,7 @@ as instance resolution.
 - [x] Provider modules (`func(*Injector)` + `Apply`)
 - [x] Ordered start hooks (`Start` with rollback)
 - [x] Exactly-once construction (per-key `sync.Once`)
+- [x] Introspection (`Graph` iterator, `Describe`, `DOT`)
 - [ ] Scopes (singleton / transient / scoped)
 
 ## FAQ
