@@ -1,0 +1,20 @@
+# golangci-lint v2 configuration (schema version 2).
+version: "2"
+
+linters:
+  # "standard" = errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+  enable:
+    - misspell    # common misspellings
+    - revive      # style/lint, golint successor
+    - gocritic    # opinionated diagnostics
+    - bodyclose   # unclosed HTTP bodies
+    - errorlint   # error-wrapping correctness (errors.Is/As, %w)
+  exclusions:
+    rules:
+      # Test factories intentionally take params they don't use (the params
+      # drive DI resolution), and demo types don't need package comments.
+      - path: _test\.go
+        linters:
+          - gocritic
+          - revive
