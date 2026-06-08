@@ -81,19 +81,35 @@ func TestStart_RunsInConstructionOrder(t *testing.T) {
 	assert.Contains(t, starts, "B")
 }
 
+// okComp starts cleanly and records whether it was started and rolled back.
+type okComp struct {
+	started *bool
+	stopped *bool
+}
+
+func (c *okComp) Start(context.Context) error    { *c.started = true; return nil }
+func (c *okComp) Shutdown(context.Context) error { *c.stopped = true; return nil }
+
+// badComp depends on okComp, so okComp is GUARANTEED constructed (and thus
+// started) first — making the rollback assertion deterministic regardless of
+// map iteration order. Its Start always fails.
+type badComp struct{ ok *okComp }
+
+func (c *badComp) Start(context.Context) error { return errors.New("start failed: bad") }
+
 func TestStart_RollsBackOnFailure(t *testing.T) {
-	var starts, stops []string
+	var okStarted, okStopped bool
 
 	inj := NewInjector()
-	inj.InjectQualified("ok", func() *lifeComp { return &lifeComp{name: "OK", startLog: &starts, stopLog: &stops} })
-	inj.InjectQualified("bad", func() *lifeComp { return &lifeComp{name: "BAD", startLog: &starts, stopLog: &stops, failOn: true} })
+	inj.Inject(func() *okComp { return &okComp{started: &okStarted, stopped: &okStopped} })
+	inj.Inject(func(ok *okComp) *badComp { return &badComp{ok: ok} })
 
 	require.NoError(t, inj.Build())
 	err := inj.Start(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "start failed")
-	// The successfully started component was rolled back (Shutdown called).
-	assert.Contains(t, stops, "OK")
+	assert.True(t, okStarted, "ok component should have started")
+	assert.True(t, okStopped, "ok component should be rolled back (shut down) on failure")
 }
 
 // ----------------------------------------------------------------------------
