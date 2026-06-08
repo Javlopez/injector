@@ -48,10 +48,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pin to the Go release golangci-lint is built against. Using `stable`
+      # (now go1.26) makes golangci-lint v2.4.0 (built with go1.25) panic when
+      # it parses the newer GOROOT stdlib. Keep this matched to the lint version.
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: stable
+          go-version: "1.25"
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v7
